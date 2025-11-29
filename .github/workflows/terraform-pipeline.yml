@@ -1,113 +1,329 @@
-name: Terraform-eks-dev-Pipeline
+name: Terraform Deploy
 
+# Trigger workflow manually with variant selection
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
-  workflow_dispatch:   # 👈 allows manual trigger from GitHub Actions UI
-permissions:
-  issues: write     # allow creating approval issues
-  contents: read    # allow checkout of repo
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, prod, release]
+
+      dev_variant:
+        description: 'Select dev variant'
+        required: false
+        default: 'dev-a'
+        type: choice
+        options: [dev-a, dev-b]
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.0
 
 jobs:
-  checkout-and-scan:
-    name: Checkout & Snyk Scan
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout main branch
-        uses: actions/checkout@v4
-        with:
-          ref: main
+  # -------------------------------------------------------
+  # 🔐 SECURITY SCANNING JOBS (Run before Terraform Plan)
+  # -------------------------------------------------------
 
-      - name: Set up Snyk
+  # -------------------------------------------------------
+  # 1️⃣ Snyk IaC Scan
+  # Specialization:
+  # - Detect misconfigurations, insecure Terraform patterns
+  # - Cloud security vulnerabilities
+  # - Advanced IaC graph engine for dependencies and risks
+  # -------------------------------------------------------
+  snyk_scan:
+    name: "Snyk IaC Scan"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Snyk CLI
         uses: snyk/actions/setup@master
 
-      - name: Run Snyk IaC Test
-        uses: snyk/actions/iac@master
-        with:
-          args: --report
+      - name: Run Snyk IaC Scan
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        continue-on-error: true   # Don't block pipeline on Snyk issues
+        run: |
+          echo "🔥 Snyk IaC scanning..."
+          snyk iac test --report || true
 
-  terraform-plan:
-    name: Terraform Init & Plan
-    runs-on: ubuntu-latest
-    needs: checkout-and-scan
-    defaults:
-      run:
-        working-directory: dev
-    steps:
-      - name: Checkout main branch
-        uses: actions/checkout@v4
+      - name: Upload SARIF to GitHub Security Dashboard
+        uses: github/codeql-action/upload-sarif@v3
         with:
-          ref: main
+          sarif_file: snyk.sarif
+
+
+  # -------------------------------------------------------
+  # 2️⃣ Checkov Scan
+  # Specialization:
+  # - Deep static analysis for Terraform, Helm, CloudFormation
+  # - 1000+ built-in policies (AWS, GCP, Azure)
+  # - Detect open SGs, insecure IAM, unencrypted resources
+  # -------------------------------------------------------
+  checkov_scan:
+    name: "Checkov Terraform Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Checkov
+        run: pip install checkov
+
+      - name: Run Checkov analysis
+        run: |
+          echo "🔎 Running Checkov..."
+          checkov -d . --output-file-path checkov.sarif --output-format sarif || true
+
+      - name: Upload Checkov Results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+
+
+  # -------------------------------------------------------
+  # 3️⃣ Terrascan Scan
+  # Specialization:
+  # - Compliance frameworks: CIS, PCI, NIST, SOC2
+  # - Specialized for infra-level security posture
+  # - Detect forbidden configurations & compliance drift
+  # -------------------------------------------------------
+  terrascan_scan:
+    name: "Terrascan Compliance Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Terrascan
+        run: |
+          curl -L "$(curl -s https://api.github.com/repos/tenable/terrascan/releases/latest | grep linux_amd64.tar.gz | cut -d '"' -f 4)" -o terrascan.tar.gz
+          tar -xvf terrascan.tar.gz
+          sudo mv terrascan /usr/local/bin/
+
+      - name: Run Terrascan
+        run: |
+          echo "🛡 Running Terrascan..."
+          terrascan scan -o sarif > terrascan.sarif || true
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: terrascan.sarif
+
+
+  # -------------------------------------------------------
+  # 4️⃣ OPA Conftest Policy-as-Code
+  # Specialization:
+  # - Organization-level custom policies
+  # - Enforce naming standards, tag requirements, IAM rules
+  # - Most flexible, customizable policy engine
+  # -------------------------------------------------------
+  conftest_scan:
+    name: "OPA Conftest Policy Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Conftest
+        run: |
+          curl -L https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz -o conftest.tar.gz
+          tar -xvf conftest.tar.gz
+          sudo mv conftest /usr/local/bin/
+
+      - name: Run Conftest Policies
+        run: |
+          echo "📜 Running OPA/Conftest..."
+          conftest test . --policy policies --output tap > conftest.tap || true
+
+      - name: Convert TAP → SARIF
+        run: |
+          python3 << 'EOF'
+import json
+issues=[]
+with open("conftest.tap") as f:
+    for line in f:
+        if line.startswith("not ok"):
+            issues.append({"ruleId":"opa-policy","message":line.strip(),"level":"error"})
+sarif={"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Conftest"}},"results":issues}]}
+open("conftest.sarif","w").write(json.dumps(sarif,indent=2))
+EOF
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: conftest.sarif
+
+
+  # -------------------------------------------------------
+  # MAIN WORKFLOW (Plan → Approval → Apply → Notify)
+  # Terraform plan waits for all scanners
+  # -------------------------------------------------------
+  terraform_plan:
+    needs: [snyk_scan, checkov_scan, terrascan_scan, conftest_scan]
+    name: 'Terraform Plan - ${{ inputs.environment }}'
+    runs-on: ubuntu-latest
+    outputs:
+      tfplan: ${{ steps.plan.outputs.stdout }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine environment path
+        id: env_path
+        run: |
+          if [ "${{ inputs.environment }}" = "dev" ]; then
+            echo "path=environments/dev" >> $GITHUB_OUTPUT
+            echo "tfvars_file=${{ inputs.dev_variant }}.tfvars" >> $GITHUB_OUTPUT
+            echo "display_env=${{ inputs.dev_variant }}" >> $GITHUB_OUTPUT
+          else
+            echo "path=environments/${{ inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "tfvars_file=terraform.tfvars" >> $GITHUB_OUTPUT
+            echo "display_env=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Terraform Init
-        run: terraform init
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-           
+        run: |
+          cd ${{ steps.env_path.outputs.path }}
+          terraform init
 
       - name: Terraform Plan
-        run: terraform plan -out=terraform.tfplan
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-           
+        id: plan
+        run: |
+          cd ${{ steps.env_path.outputs.path }}
+          terraform plan -var-file="${{ steps.env_path.outputs.tfvars_file }}" -out=tfplan
+          terraform show -json tfplan > tfplan.json
+        continue-on-error: true
 
       - name: Upload Plan
         uses: actions/upload-artifact@v4
         with:
-          name: tfplan
-          path: dev/terraform.tfplan
+          name: tfplan-${{ steps.env_path.outputs.display_env }}
+          path: ${{ steps.env_path.outputs.path }}/tfplan
+          retention-days: 5
 
-  terraform-apply:
-    name: Terraform Apply (Manual Approval)
+
+  # -------------------------------------------------------
+  # Approval for production
+  # -------------------------------------------------------
+  approval:
+    name: 'Approval Required - ${{ inputs.environment }}'
+    if: inputs.environment == 'prod'
+    needs: terraform_plan
     runs-on: ubuntu-latest
-    needs: terraform-plan
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - name: Wait for approval
-        uses: trstringer/manual-approval@v1
-        with:
-          approvers: sandeshhypha-eng   # GitHub username(s), comma-separated if multiple
-          secret: ${{ secrets.GITHUB_TOKEN }}
-          minimum-approvals: 1          # how many approvals required
-          issue-title: "Terraform Apply Approval Needed"
-          issue-body: "Please approve or deny the Terraform Apply step."
+    environment:
+      name: ${{ inputs.environment }}
 
-      - name: Checkout main branch
+    steps:
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: main
+
+      - name: Display Approval Message
+        run: |
+          echo "⏸ Production deployment requires approval"
+
+
+  # -------------------------------------------------------
+  # Apply
+  # -------------------------------------------------------
+  terraform_apply:
+    name: 'Terraform Apply - ${{ inputs.environment }}'
+    needs: [terraform_plan, approval]
+    if: always() && (inputs.environment != 'prod' || needs.approval.result == 'success')
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Terraform Init
-        run: terraform init
-        working-directory: dev
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine environment path
+        id: env_path
+        run: |
+          if [ "${{ inputs.environment }}" = "dev" ]; then
+            echo "path=environments/dev" >> $GITHUB_OUTPUT
+            echo "tfvars_file=${{ inputs.dev_variant }}.tfvars" >> $GITHUB_OUTPUT
+            echo "display_env=${{ inputs.dev_variant }}" >> $GITHUB_OUTPUT
+          else
+            echo "path=environments/${{ inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "tfvars_file=terraform.tfvars" >> $GITHUB_OUTPUT
+            echo "display_env=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Download Plan
         uses: actions/download-artifact@v4
         with:
-          name: tfplan
-          path: dev
+          name: tfplan-${{ steps.env_path.outputs.display_env }}
+          path: ${{ steps.env_path.outputs.path }}
+
+      - name: Terraform Init
+        run: |
+          cd ${{ steps.env_path.outputs.path }}
+          terraform init
 
       - name: Terraform Apply
-        run: terraform apply -auto-approve terraform.tfplan
-        working-directory: dev
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          cd ${{ steps.env_path.outputs.path }}
+          terraform apply -auto-approve tfplan
+
+
+  # -------------------------------------------------------
+  # Notify job
+  # -------------------------------------------------------
+  notify:
+    name: "Deployment Notification"
+    needs: [terraform_plan, terraform_apply]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Determine Status
+        id: status
+        run: |
+          if [ "${{ needs.terraform_apply.result }}" = "success" ]; then
+            echo "status=Success" >> $GITHUB_OUTPUT
+          else
+            echo "status=Failed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Print Notification
+        run: |
+          echo "Deployment Status: ${{ steps.status.outputs.status }}"
+
